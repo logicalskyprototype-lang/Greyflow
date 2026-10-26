@@ -1,5 +1,6 @@
 
 import hmac
+import json
 import os
 import re
 from typing import Any, Literal
@@ -29,6 +30,10 @@ MAX_PROMPT_LENGTH = 4000
 MAX_RUNPOD_PROMPT_LENGTH = 2000
 MAX_RUNPOD_DIMENSION = 512
 MAX_RUNPOD_STEPS = 35
+
+# A 25 MiB image needs at most about 33.34 MiB of Base64.
+# Leave limited room for the surrounding JSON response.
+MAX_PROVIDER_RESPONSE_BYTES = 36 * 1024 * 1024
 
 RUNPOD_JOB_STATUSES = frozenset({
     "IN_QUEUE",
@@ -327,16 +332,54 @@ async def generate_image(
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
+            async with client.stream(
+                "POST",
                 OPENAI_API_URL,
                 headers={
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
                     "Content-Type": "application/json",
                 },
                 json=provider_payload,
-            )
-            response.raise_for_status()
-            provider_result = response.json()
+            ) as response:
+                response.raise_for_status()
+
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None:
+                    try:
+                        declared_length = int(content_length)
+                    except ValueError:
+                        declared_length = None
+
+                    if (
+                        declared_length is not None
+                        and declared_length > MAX_PROVIDER_RESPONSE_BYTES
+                    ):
+                        raise HTTPException(
+                            status_code=502,
+                            detail=(
+                                "Image provider response exceeded "
+                                "the allowed size."
+                            ),
+                        )
+
+                body = bytearray()
+
+                async for chunk in response.aiter_bytes():
+                    if (
+                        len(body) + len(chunk)
+                        > MAX_PROVIDER_RESPONSE_BYTES
+                    ):
+                        raise HTTPException(
+                            status_code=502,
+                            detail=(
+                                "Image provider response exceeded "
+                                "the allowed size."
+                            ),
+                        )
+
+                    body.extend(chunk)
+
+                provider_result = json.loads(body)
 
     except httpx.TimeoutException:
         raise HTTPException(
@@ -373,8 +416,6 @@ async def generate_image(
 
     image_items = provider_result.get("data")
 
-    # The request asks for one image. Reject ambiguous responses rather
-    # than returning multiple images or silently selecting one.
     if not isinstance(image_items, list) or len(image_items) != 1:
         raise HTTPException(
             status_code=502,
@@ -402,7 +443,6 @@ async def generate_image(
     )
     expected_size = (expected_width, expected_height)
 
-    # The helper checks the encoded-length limit before Base64 decoding.
     image_bytes = decode_valid_png(encoded_image, expected_size)
 
     if image_bytes is None:
