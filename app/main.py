@@ -3,11 +3,13 @@ import base64
 import hmac
 import os
 import re
+from io import BytesIO
 from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.runpod_contract import validate_worker_output
@@ -30,6 +32,10 @@ MAX_RUNPOD_PROMPT_LENGTH = 2000
 MAX_RUNPOD_DIMENSION = 512
 MAX_RUNPOD_STEPS = 35
 
+# Apply resource limits before fully decoding provider-supplied image data.
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_IMAGE_PIXELS = 25_000_000
+
 RUNPOD_JOB_STATUSES = frozenset({
     "IN_QUEUE",
     "IN_PROGRESS",
@@ -40,7 +46,6 @@ RUNPOD_JOB_STATUSES = frozenset({
 })
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-PNG_IHDR_CHUNK = b"IHDR"
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -138,6 +143,65 @@ class RunPodJobStatus(BaseModel):
     status: str
     output: Any | None = None
     error: str | None = None
+
+
+def is_valid_png(
+    image_bytes: bytes,
+    expected_size: tuple[int, int],
+) -> bool:
+    """Validate PNG structure, dimensions, resource limits, and pixel data."""
+    if (
+        not image_bytes
+        or len(image_bytes) > MAX_IMAGE_BYTES
+        or not image_bytes.startswith(PNG_SIGNATURE)
+    ):
+        return False
+
+    try:
+        # Verify the PNG structure without fully decoding its pixel data.
+        with Image.open(BytesIO(image_bytes)) as image:
+            if image.format != "PNG":
+                return False
+
+            width, height = image.size
+
+            if (
+                width < 1
+                or height < 1
+                or (width, height) != expected_size
+                or width * height > MAX_IMAGE_PIXELS
+            ):
+                return False
+
+            image.verify()
+
+        # Reopen after verify(), then decode the actual pixel data.
+        with Image.open(BytesIO(image_bytes)) as image:
+            if image.format != "PNG":
+                return False
+
+            width, height = image.size
+
+            if (
+                width < 1
+                or height < 1
+                or (width, height) != expected_size
+                or width * height > MAX_IMAGE_PIXELS
+            ):
+                return False
+
+            image.load()
+
+        return True
+
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+        SyntaxError,
+        Image.DecompressionBombError,
+    ):
+        return False
 
 
 def require_api_key(supplied_key: str | None) -> None:
@@ -383,6 +447,11 @@ async def generate_image(
             detail="Image provider returned no image.",
         )
 
+    expected_width, expected_height = (
+        int(part) for part in request.size.split("x")
+    )
+    expected_size = (expected_width, expected_height)
+
     generated_images: list[GeneratedImage] = []
 
     for item in image_items:
@@ -402,13 +471,7 @@ async def generate_image(
         except (ValueError, TypeError):
             continue
 
-        # Reject payloads that do not have a recognizable PNG header.
-        # This is a basic structural check, not full image decoding.
-        if (
-            len(image_bytes) < 24
-            or not image_bytes.startswith(PNG_SIGNATURE)
-            or image_bytes[12:16] != PNG_IHDR_CHUNK
-        ):
+        if not is_valid_png(image_bytes, expected_size):
             continue
 
         generated_images.append(
