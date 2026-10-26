@@ -35,6 +35,10 @@ MAX_RUNPOD_STEPS = 35
 # Leave limited room for the surrounding JSON response.
 MAX_PROVIDER_RESPONSE_BYTES = 36 * 1024 * 1024
 
+# RunPod worker images are limited to 5 MiB after Base64 decoding.
+# Eight MiB accommodates the corresponding Base64 and JSON overhead.
+MAX_RUNPOD_RESPONSE_BYTES = 8 * 1024 * 1024
+
 RUNPOD_JOB_STATUSES = frozenset({
     "IN_QUEUE",
     "IN_PROGRESS",
@@ -188,20 +192,51 @@ async def call_runpod(
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            if method == "POST":
-                response = await client.post(
-                    url,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json=payload or {},
-                )
-            else:
-                response = await client.get(
-                    url,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
+            async with client.stream(
+                method,
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload if method == "POST" else None,
+            ) as response:
+                response.raise_for_status()
 
-            response.raise_for_status()
-            result = response.json()
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None:
+                    try:
+                        declared_length = int(content_length)
+                    except ValueError:
+                        declared_length = None
+
+                    if (
+                        declared_length is not None
+                        and declared_length > MAX_RUNPOD_RESPONSE_BYTES
+                    ):
+                        raise HTTPException(
+                            status_code=502,
+                            detail=(
+                                "RunPod response exceeded the "
+                                "allowed size."
+                            ),
+                        )
+
+                body = bytearray()
+
+                async for chunk in response.aiter_bytes():
+                    if (
+                        len(body) + len(chunk)
+                        > MAX_RUNPOD_RESPONSE_BYTES
+                    ):
+                        raise HTTPException(
+                            status_code=502,
+                            detail=(
+                                "RunPod response exceeded the "
+                                "allowed size."
+                            ),
+                        )
+
+                    body.extend(chunk)
+
+                result = json.loads(body)
 
     except httpx.TimeoutException:
         if method == "POST":
