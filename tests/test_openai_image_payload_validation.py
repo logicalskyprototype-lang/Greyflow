@@ -1,6 +1,7 @@
 
 import base64
 import io
+import json
 import struct
 import unittest
 from unittest.mock import patch
@@ -24,21 +25,30 @@ def valid_png_bytes(width=1024, height=1024):
 
 class FakeResponse:
     status_code = 200
-    payload = {
-        "data": [
-            {
-                "b64_json": base64.b64encode(
-                    b"this is not an image"
-                ).decode("ascii")
-            }
-        ]
-    }
+    payload = {}
+    headers = {}
+    chunks = None
+    iteration_started = False
 
     def raise_for_status(self):
         return None
 
-    def json(self):
-        return self.payload
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def aiter_bytes(self):
+        type(self).iteration_started = True
+
+        if type(self).chunks is not None:
+            for chunk in type(self).chunks:
+                yield chunk
+            return
+
+        body = json.dumps(type(self).payload).encode("utf-8")
+        yield body
 
 
 class FakeAsyncClient:
@@ -51,7 +61,7 @@ class FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, traceback):
         return False
 
-    async def post(self, url, headers=None, json=None):
+    def stream(self, method, url, headers=None, json=None):
         return FakeResponse()
 
 
@@ -73,6 +83,9 @@ class ImagePayloadValidationTests(unittest.TestCase):
                 }
             ]
         }
+        FakeResponse.headers = {}
+        FakeResponse.chunks = None
+        FakeResponse.iteration_started = False
 
         self.client_patch = patch.object(
             main.httpx,
@@ -122,7 +135,6 @@ class ImagePayloadValidationTests(unittest.TestCase):
         self.assert_payload_rejected()
 
     def test_truncated_png_is_rejected(self):
-        # PNG signature and an incomplete IHDR chunk are not a complete file.
         truncated_png = (
             b"\x89PNG\r\n\x1a\n"
             + struct.pack(">I", 13)
@@ -142,7 +154,6 @@ class ImagePayloadValidationTests(unittest.TestCase):
         self.assert_payload_rejected()
 
     def test_valid_png_with_wrong_dimensions_is_rejected(self):
-        # The request defaults to 1024x1024, but this PNG is 512x512.
         FakeResponse.payload = {
             "data": [
                 {
@@ -170,8 +181,6 @@ class ImagePayloadValidationTests(unittest.TestCase):
         self.assertEqual(len(response.json()["images"]), 1)
 
     def test_oversized_base64_string_is_rejected(self):
-        # This exceeds the encoded-size limit and must be rejected
-        # before Base64 decoding is attempted.
         FakeResponse.payload = {
             "data": [
                 {
@@ -199,6 +208,31 @@ class ImagePayloadValidationTests(unittest.TestCase):
         FakeResponse.payload = {"data": []}
 
         self.assert_payload_rejected()
+
+    def test_oversized_content_length_is_rejected_before_reading(self):
+        FakeResponse.headers = {
+            "Content-Length": str(
+                main.MAX_PROVIDER_RESPONSE_BYTES + 1
+            )
+        }
+
+        response = self.post_image_request()
+
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(FakeResponse.iteration_started)
+
+    def test_streamed_body_limit_is_enforced_without_content_length(self):
+        FakeResponse.headers = {}
+        FakeResponse.chunks = [
+            b"x" * 64,
+            b"x",
+        ]
+
+        with patch.object(main, "MAX_PROVIDER_RESPONSE_BYTES", 64):
+            response = self.post_image_request()
+
+        self.assertEqual(response.status_code, 502)
+        self.assertTrue(FakeResponse.iteration_started)
 
 
 if __name__ == "__main__":
