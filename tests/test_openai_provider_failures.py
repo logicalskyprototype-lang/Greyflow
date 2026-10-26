@@ -1,4 +1,6 @@
 
+import base64
+import struct
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +8,16 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app import main
+
+
+def png_header_base64(width=512, height=512):
+    """Build a minimal PNG-header fixture for contract validation."""
+    png_header = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\rIHDR"
+        + struct.pack(">II", width, height)
+    )
+    return base64.b64encode(png_header).decode("ascii")
 
 
 class FakeResponse:
@@ -205,7 +217,7 @@ class OpenAIProviderFailureTests(unittest.TestCase):
 
     def test_successful_provider_response_uses_server_credentials(self):
         FakeAsyncClient.next_payload = {
-            "data": [{"b64_json": "aGVsbG8="}],
+            "data": [{"b64_json": png_header_base64()}],
         }
 
         response = self.generate()
