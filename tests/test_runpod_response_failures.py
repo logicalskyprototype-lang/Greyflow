@@ -1,4 +1,5 @@
 
+import json
 import unittest
 from unittest.mock import patch
 
@@ -14,14 +15,39 @@ class FakeResponse:
         payload,
         status_code=200,
         json_exception=None,
+        body=None,
+        headers=None,
+        stream_exception=None,
     ):
         self.payload = payload
         self.status_code = status_code
         self.json_exception = json_exception
+        self.stream_exception = stream_exception
+
+        if body is not None:
+            self.body = body
+        elif json_exception is not None:
+            self.body = b"{malformed provider JSON"
+        else:
+            self.body = json.dumps(payload).encode("utf-8")
+
+        self.headers = (
+            {"Content-Length": str(len(self.body))}
+            if headers is None
+            else headers
+        )
         self.request = httpx.Request(
             "POST",
             "https://provider.test/request",
         )
+
+    async def __aenter__(self):
+        if self.stream_exception is not None:
+            raise self.stream_exception
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -35,10 +61,10 @@ class FakeResponse:
                 response=response,
             )
 
-    def json(self):
-        if self.json_exception is not None:
-            raise self.json_exception
-        return self.payload
+    async def aiter_bytes(self):
+        chunk_size = 64 * 1024
+        for start in range(0, len(self.body), chunk_size):
+            yield self.body[start : start + chunk_size]
 
 
 class FakeAsyncClient:
@@ -46,6 +72,8 @@ class FakeAsyncClient:
     next_status_code = 200
     next_exception = None
     next_json_exception = None
+    next_body = None
+    next_headers = None
     calls = []
 
     def __init__(self, **kwargs):
@@ -57,28 +85,17 @@ class FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, traceback):
         return False
 
-    async def post(self, url, headers=None, json=None):
-        self.calls.append(("POST", url, headers or {}, json))
-
-        if self.next_exception is not None:
-            raise self.next_exception
+    def stream(self, method, url, headers=None, json=None):
+        method = method.upper()
+        self.calls.append((method, url, headers or {}, json))
 
         return FakeResponse(
-            self.next_payload,
-            self.next_status_code,
-            self.next_json_exception,
-        )
-
-    async def get(self, url, headers=None):
-        self.calls.append(("GET", url, headers or {}, None))
-
-        if self.next_exception is not None:
-            raise self.next_exception
-
-        return FakeResponse(
-            self.next_payload,
-            self.next_status_code,
-            self.next_json_exception,
+            payload=self.next_payload,
+            status_code=self.next_status_code,
+            json_exception=self.next_json_exception,
+            body=self.next_body,
+            headers=self.next_headers,
+            stream_exception=self.next_exception,
         )
 
 
@@ -100,6 +117,8 @@ class RunPodResponseFailureTests(unittest.TestCase):
         FakeAsyncClient.next_status_code = 200
         FakeAsyncClient.next_exception = None
         FakeAsyncClient.next_json_exception = None
+        FakeAsyncClient.next_body = None
+        FakeAsyncClient.next_headers = None
         FakeAsyncClient.calls = []
 
         self.client_patch = patch.object(
@@ -241,6 +260,41 @@ class RunPodResponseFailureTests(unittest.TestCase):
             "Mock provider failure",
         )
 
+    def test_oversized_content_length_is_rejected(self):
+        FakeAsyncClient.next_payload = {
+            "id": "job_123",
+            "status": "IN_QUEUE",
+        }
+        FakeAsyncClient.next_headers = {
+            "Content-Length": str(
+                main.MAX_RUNPOD_RESPONSE_BYTES + 1
+            ),
+        }
+
+        for request_name in ("submit", "poll"):
+            with self.subTest(request=request_name):
+                response = (
+                    self.submit_job()
+                    if request_name == "submit"
+                    else self.check_job_status()
+                )
+                self.assertEqual(response.status_code, 502)
+
+    def test_streamed_response_over_limit_is_rejected(self):
+        FakeAsyncClient.next_headers = {}
+        FakeAsyncClient.next_body = (
+            b"x" * (main.MAX_RUNPOD_RESPONSE_BYTES + 1)
+        )
+
+        for request_name in ("submit", "poll"):
+            with self.subTest(request=request_name):
+                response = (
+                    self.submit_job()
+                    if request_name == "submit"
+                    else self.check_job_status()
+                )
+                self.assertEqual(response.status_code, 502)
+
     def test_submission_timeout_returns_504_without_auto_retry(self):
         FakeAsyncClient.next_exception = httpx.ReadTimeout(
             "Mock submission timeout"
@@ -249,8 +303,14 @@ class RunPodResponseFailureTests(unittest.TestCase):
         response = self.submit_job()
 
         self.assertEqual(response.status_code, 504)
-        self.assertIn("may have been accepted", response.json()["detail"])
-        self.assertIn("do not retry automatically", response.json()["detail"])
+        self.assertIn(
+            "may have been accepted",
+            response.json()["detail"],
+        )
+        self.assertIn(
+            "do not retry automatically",
+            response.json()["detail"],
+        )
         self.assertEqual(
             sum(call[0] == "POST" for call in FakeAsyncClient.calls),
             1,
@@ -275,18 +335,21 @@ class RunPodResponseFailureTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
 
     def test_rate_limit_returns_429_for_submission_and_polling(self):
-        for request in ("submit", "poll"):
-            with self.subTest(request=request):
+        for request_name in ("submit", "poll"):
+            with self.subTest(request=request_name):
                 FakeAsyncClient.next_status_code = 429
 
                 response = (
                     self.submit_job()
-                    if request == "submit"
+                    if request_name == "submit"
                     else self.check_job_status()
                 )
 
                 self.assertEqual(response.status_code, 429)
-                self.assertIn("rate limit", response.json()["detail"].lower())
+                self.assertIn(
+                    "rate limit",
+                    response.json()["detail"].lower(),
+                )
 
     def test_missing_job_during_polling_returns_404(self):
         FakeAsyncClient.next_status_code = 404
@@ -299,7 +362,9 @@ class RunPodResponseFailureTests(unittest.TestCase):
             "RunPod job was not found.",
         )
 
-    def test_provider_auth_failures_return_502_without_leaking_secrets(self):
+    def test_provider_auth_failures_return_502_without_leaking_secrets(
+        self,
+    ):
         for status_code in (401, 403):
             with self.subTest(status_code=status_code):
                 FakeAsyncClient.next_status_code = status_code
@@ -311,20 +376,23 @@ class RunPodResponseFailureTests(unittest.TestCase):
                 self.assertNotIn("Bearer", response.text)
 
     def test_malformed_provider_json_returns_502(self):
-        for request in ("submit", "poll"):
-            with self.subTest(request=request):
+        for request_name in ("submit", "poll"):
+            with self.subTest(request=request_name):
                 FakeAsyncClient.next_json_exception = ValueError(
                     "Malformed provider JSON"
                 )
 
                 response = (
                     self.submit_job()
-                    if request == "submit"
+                    if request_name == "submit"
                     else self.check_job_status()
                 )
 
                 self.assertEqual(response.status_code, 502)
-                self.assertNotIn("Malformed provider JSON", response.text)
+                self.assertNotIn(
+                    "Malformed provider JSON",
+                    response.text,
+                )
 
     def test_connection_failure_returns_502(self):
         request = httpx.Request(
