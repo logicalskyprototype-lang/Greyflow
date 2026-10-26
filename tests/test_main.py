@@ -365,9 +365,8 @@ class GreyFlowApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
 
     def test_openai_image_endpoint_preserves_response_format(self):
-        encoded = base64.b64encode(
-            b"fake-png-content"
-        ).decode("ascii")
+        # Use the shared PNG-header fixture rather than fake text bytes.
+        encoded = png_header_base64()
 
         FakeAsyncClient.next_payload = {
             "data": [{"b64_json": encoded}],
