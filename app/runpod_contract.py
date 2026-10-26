@@ -27,11 +27,12 @@ class RunPodImageOutput(BaseModel):
     @field_validator("job_id")
     @classmethod
     def validate_job_id(cls, value: str) -> str:
-        if not value or any(
-            character not in
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-            for character in value
-        ):
+        allowed = (
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "0123456789_-"
+        )
+        if not value or any(character not in allowed for character in value):
             raise ValueError("Invalid worker job ID.")
         return value
 
@@ -66,23 +67,12 @@ class RunPodImageOutput(BaseModel):
 
         if not image_bytes:
             raise ValueError("Image data must not be empty.")
-
         if len(image_bytes) > MAX_IMAGE_BYTES:
             raise ValueError("Image exceeds the maximum allowed size.")
-
         if not image_bytes.startswith(PNG_SIGNATURE):
             raise ValueError("Image data does not have a PNG signature.")
-
         if len(image_bytes) < 24:
             raise ValueError("PNG image data is incomplete.")
-
-        # PNG IHDR stores the image dimensions at fixed byte offsets.
-        png_width, png_height = struct.unpack(">II", image_bytes[16:24])
-
-        if png_width != 0 and png_width != 0:
-            # Dimensions are checked against the worker's declared values
-            # by validate_worker_output() below.
-            pass
 
         return value
 
@@ -96,14 +86,17 @@ def validate_worker_output(
     result = RunPodImageOutput.model_validate(output)
 
     if result.job_id != expected_job_id:
-        raise ValueError("Worker output job ID does not match the requested job.")
+        raise ValueError(
+            "Worker output job ID does not match the requested job."
+        )
 
     image_bytes = base64.b64decode(result.image_base64, validate=True)
     image_width, image_height = struct.unpack(">II", image_bytes[16:24])
 
     if image_width != result.width or image_height != result.height:
-        raise ValueError("PNG dimensions do not match the declared dimensions.")
-
+        raise ValueError(
+            "PNG dimensions do not match the declared dimensions."
+        )
     if image_width < 1 or image_height < 1:
         raise ValueError("PNG dimensions must be positive.")
 
