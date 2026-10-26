@@ -1,4 +1,6 @@
+
 import base64
+import struct
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +8,32 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app import main
+
+
+def png_header_base64(width=512, height=512):
+    """Build a minimal PNG header fixture for contract validation."""
+    png_header = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\rIHDR"
+        + struct.pack(">II", width, height)
+    )
+    return base64.b64encode(png_header).decode("ascii")
+
+
+def valid_worker_output(
+    job_id="job_123",
+    width=512,
+    height=512,
+):
+    return {
+        "job_id": job_id,
+        "status": "completed",
+        "content_type": "image/png",
+        "seed": 123,
+        "width": width,
+        "height": height,
+        "image_base64": png_header_base64(width, height),
+    }
 
 
 class FakeResponse:
@@ -116,6 +144,12 @@ class GreyFlowApiTests(unittest.TestCase):
             "X-GreyFlow-API-Key": "test-greyflow-key",
         }
 
+    def get_job_status(self):
+        return self.client.get(
+            "/v1/jobs/images/job_123",
+            headers=self.headers(),
+        )
+
     def test_health_reports_service_and_version(self):
         response = self.client.get("/health")
 
@@ -163,9 +197,7 @@ class GreyFlowApiTests(unittest.TestCase):
 
         call = FakeAsyncClient.calls[0]
         self.assertEqual(call["method"], "POST")
-        self.assertTrue(
-            call["url"].endswith("/test-endpoint/run")
-        )
+        self.assertTrue(call["url"].endswith("/test-endpoint/run"))
         self.assertEqual(
             call["headers"]["Authorization"],
             "Bearer test-runpod-key",
@@ -181,33 +213,23 @@ class GreyFlowApiTests(unittest.TestCase):
             },
         )
 
-    def test_runpod_status_uses_get_and_returns_output(self):
+    def test_completed_runpod_job_returns_validated_output(self):
         FakeAsyncClient.next_payload = {
             "id": "job_123",
             "status": "COMPLETED",
-            "output": {
-                "job_id": "job_123",
-                "status": "completed",
-                "content_type": "image/png",
-                "seed": 123,
-                "width": 512,
-                "height": 512,
-                "image_base64": "ZmFrZS1pbWFnZQ==",
-            },
+            "output": valid_worker_output(),
         }
 
-        response = self.client.get(
-            "/v1/jobs/images/job_123",
-            headers=self.headers(),
-        )
+        response = self.get_job_status()
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["job_id"], "job_123")
-        self.assertEqual(response.json()["status"], "COMPLETED")
-        self.assertEqual(
-            response.json()["output"]["content_type"],
-            "image/png",
-        )
+        body = response.json()
+        self.assertEqual(body["job_id"], "job_123")
+        self.assertEqual(body["status"], "COMPLETED")
+        self.assertEqual(body["output"]["job_id"], "job_123")
+        self.assertEqual(body["output"]["content_type"], "image/png")
+        self.assertEqual(body["output"]["width"], 512)
+        self.assertEqual(body["output"]["height"], 512)
 
         call = FakeAsyncClient.calls[0]
         self.assertEqual(call["method"], "GET")
@@ -216,6 +238,81 @@ class GreyFlowApiTests(unittest.TestCase):
                 "/test-endpoint/status/job_123"
             )
         )
+
+    def test_completed_job_rejects_invalid_base64(self):
+        output = valid_worker_output()
+        output["image_base64"] = "not-valid-base64!"
+
+        FakeAsyncClient.next_payload = {
+            "id": "job_123",
+            "status": "COMPLETED",
+            "output": output,
+        }
+
+        response = self.get_job_status()
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.json()["detail"],
+            "RunPod completed the job but returned an invalid image result.",
+        )
+
+    def test_completed_job_rejects_non_png_data(self):
+        output = valid_worker_output()
+        output["image_base64"] = base64.b64encode(
+            b"this is not a PNG file"
+        ).decode("ascii")
+
+        FakeAsyncClient.next_payload = {
+            "id": "job_123",
+            "status": "COMPLETED",
+            "output": output,
+        }
+
+        response = self.get_job_status()
+
+        self.assertEqual(response.status_code, 502)
+
+    def test_completed_job_rejects_mismatched_png_dimensions(self):
+        output = valid_worker_output(width=512, height=512)
+        output["image_base64"] = png_header_base64(
+            width=256,
+            height=512,
+        )
+
+        FakeAsyncClient.next_payload = {
+            "id": "job_123",
+            "status": "COMPLETED",
+            "output": output,
+        }
+
+        response = self.get_job_status()
+
+        self.assertEqual(response.status_code, 502)
+
+    def test_completed_job_rejects_worker_job_id_mismatch(self):
+        FakeAsyncClient.next_payload = {
+            "id": "job_123",
+            "status": "COMPLETED",
+            "output": valid_worker_output(job_id="different_job"),
+        }
+
+        response = self.get_job_status()
+
+        self.assertEqual(response.status_code, 502)
+
+    def test_queued_job_does_not_require_image_output(self):
+        FakeAsyncClient.next_payload = {
+            "id": "job_123",
+            "status": "IN_QUEUE",
+            "output": None,
+        }
+
+        response = self.get_job_status()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "IN_QUEUE")
+        self.assertIsNone(response.json()["output"])
 
     def test_runpod_rejects_invalid_dimensions(self):
         response = self.client.post(
@@ -256,17 +353,14 @@ class GreyFlowApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(FakeAsyncClient.calls, [])
 
-    def test_runpod_status_rejects_mismatched_job_id(self):
+    def test_runpod_status_rejects_mismatched_outer_job_id(self):
         FakeAsyncClient.next_payload = {
             "id": "different_job",
             "status": "COMPLETED",
             "output": {},
         }
 
-        response = self.client.get(
-            "/v1/jobs/images/job_123",
-            headers=self.headers(),
-        )
+        response = self.get_job_status()
 
         self.assertEqual(response.status_code, 502)
 
