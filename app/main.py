@@ -1,4 +1,3 @@
-
 import base64
 import hmac
 import os
@@ -29,6 +28,17 @@ MAX_PROMPT_LENGTH = 4000
 MAX_RUNPOD_PROMPT_LENGTH = 2000
 MAX_RUNPOD_DIMENSION = 512
 MAX_RUNPOD_STEPS = 35
+
+# Accepted job statuses returned by RunPod.
+# Unknown statuses are treated as invalid upstream responses.
+RUNPOD_JOB_STATUSES = frozenset({
+    "IN_QUEUE",
+    "IN_PROGRESS",
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMED_OUT",
+})
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -434,7 +444,7 @@ async def submit_runpod_image_job(
         not isinstance(job_id, str)
         or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job_id)
         or not isinstance(status, str)
-        or not status
+        or status not in RUNPOD_JOB_STATUSES
     ):
         raise HTTPException(
             status_code=502,
@@ -470,7 +480,7 @@ async def get_runpod_image_job(
     if (
         returned_id != job_id
         or not isinstance(status, str)
-        or not status
+        or status not in RUNPOD_JOB_STATUSES
     ):
         raise HTTPException(
             status_code=502,
