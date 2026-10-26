@@ -39,6 +39,9 @@ RUNPOD_JOB_STATUSES = frozenset({
     "TIMED_OUT",
 })
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_IHDR_CHUNK = b"IHDR"
+
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -365,8 +368,7 @@ async def generate_image(
             detail="Could not communicate with the image provider.",
         ) from None
 
-    # JSON can be syntactically valid without having the expected structure.
-    # Validate the top-level type before calling dictionary methods.
+    # Valid JSON can still have an unexpected response structure.
     if not isinstance(provider_result, dict):
         raise HTTPException(
             status_code=502,
@@ -393,8 +395,20 @@ async def generate_image(
             continue
 
         try:
-            base64.b64decode(encoded_image, validate=True)
+            image_bytes = base64.b64decode(
+                encoded_image,
+                validate=True,
+            )
         except (ValueError, TypeError):
+            continue
+
+        # Reject payloads that do not have a recognizable PNG header.
+        # This is a basic structural check, not full image decoding.
+        if (
+            len(image_bytes) < 24
+            or not image_bytes.startswith(PNG_SIGNATURE)
+            or image_bytes[12:16] != PNG_IHDR_CHUNK
+        ):
             continue
 
         generated_images.append(
