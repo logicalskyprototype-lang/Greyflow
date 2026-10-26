@@ -1,23 +1,22 @@
 
 import base64
-import struct
+import io
 import unittest
 from unittest.mock import patch
 
 import httpx
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from app import main
 
 
-def png_header_base64(width=512, height=512):
-    """Build a minimal PNG-header fixture for contract validation."""
-    png_header = (
-        b"\x89PNG\r\n\x1a\n"
-        + b"\x00\x00\x00\rIHDR"
-        + struct.pack(">II", width, height)
-    )
-    return base64.b64encode(png_header).decode("ascii")
+def png_header_base64(width=1024, height=1024):
+    """Build a complete, valid PNG fixture in memory."""
+    buffer = io.BytesIO()
+    image = Image.new("RGB", (width, height), color=(20, 40, 60))
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 class FakeResponse:
