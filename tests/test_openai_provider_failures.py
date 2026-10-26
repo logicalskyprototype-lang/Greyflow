@@ -1,6 +1,7 @@
 
 import base64
 import io
+import json
 import unittest
 from unittest.mock import patch
 
@@ -20,10 +21,16 @@ def png_header_base64(width=1024, height=1024):
 
 
 class FakeResponse:
-    def __init__(self, payload=None, status_code=200, json_error=None):
+    def __init__(
+        self,
+        payload=None,
+        status_code=200,
+        json_error=None,
+    ):
         self.payload = payload if payload is not None else {}
         self.status_code = status_code
         self.json_error = json_error
+        self.headers = {}
         self.request = httpx.Request(
             "POST",
             "https://api.openai.com/v1/images/generations",
@@ -41,10 +48,18 @@ class FakeResponse:
                 response=response,
             )
 
-    def json(self):
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def aiter_bytes(self):
         if self.json_error is not None:
-            raise self.json_error
-        return self.payload
+            yield b"{malformed provider JSON"
+            return
+
+        yield json.dumps(self.payload).encode("utf-8")
 
 
 class FakeAsyncClient:
@@ -63,8 +78,9 @@ class FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, traceback):
         return False
 
-    async def post(self, url, headers=None, json=None):
+    def stream(self, method, url, headers=None, json=None):
         self.calls.append({
+            "method": method,
             "url": url,
             "headers": headers or {},
             "json": json,
@@ -222,13 +238,11 @@ class OpenAIProviderFailureTests(unittest.TestCase):
         response = self.generate()
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json()["status"],
-            "completed",
-        )
+        self.assertEqual(response.json()["status"], "completed")
         self.assertEqual(len(FakeAsyncClient.calls), 1)
 
         call = FakeAsyncClient.calls[0]
+        self.assertEqual(call["method"], "POST")
         self.assertEqual(
             call["headers"]["Authorization"],
             "Bearer test-openai-key",
