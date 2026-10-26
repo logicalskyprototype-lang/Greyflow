@@ -1,23 +1,22 @@
 
 import base64
-import struct
+import io
 import unittest
 from unittest.mock import patch
 
 import httpx
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from app import main
 
 
 def png_header_base64(width=512, height=512):
-    """Build a minimal PNG header fixture for contract validation."""
-    png_header = (
-        b"\x89PNG\r\n\x1a\n"
-        + b"\x00\x00\x00\rIHDR"
-        + struct.pack(">II", width, height)
-    )
-    return base64.b64encode(png_header).decode("ascii")
+    """Build a complete, valid PNG fixture in memory."""
+    buffer = io.BytesIO()
+    image = Image.new("RGB", (width, height), color=(20, 40, 60))
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def valid_worker_output(
@@ -365,8 +364,9 @@ class GreyFlowApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
 
     def test_openai_image_endpoint_preserves_response_format(self):
-        # Use the shared PNG-header fixture rather than fake text bytes.
-        encoded = png_header_base64()
+        # The OpenAI endpoint requests 1024x1024, so use a real PNG
+        # fixture with exactly those dimensions.
+        encoded = png_header_base64(width=1024, height=1024)
 
         FakeAsyncClient.next_payload = {
             "data": [{"b64_json": encoded}],
