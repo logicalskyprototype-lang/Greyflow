@@ -22,18 +22,7 @@ MAX_STEPS = 35
 MAX_DIMENSION = 512
 MAX_OUTPUT_BYTES = 5 * 1024 * 1024
 
-if not torch.cuda.is_available():
-    raise RuntimeError("GreyFlow requires a CUDA-capable NVIDIA GPU.")
-
-pipeline = StableDiffusionPipeline.from_pretrained(
-    MODEL_ID,
-    torch_dtype=torch.float16,
-    use_safetensors=True,
-    token=HF_TOKEN,
-)
-pipeline = pipeline.to("cuda")
-pipeline.set_progress_bar_config(disable=True)
-
+pipeline = None
 generation_lock = threading.Lock()
 
 
@@ -45,6 +34,30 @@ class ImageInput(BaseModel):
     height: int = Field(default=512, ge=256, le=MAX_DIMENSION)
     steps: int = Field(default=25, ge=1, le=MAX_STEPS)
     seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
+
+
+def load_model():
+    """Load the model only when the worker actually starts."""
+    global pipeline
+
+    if pipeline is not None:
+        return
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "GreyFlow requires a CUDA-capable NVIDIA GPU."
+        )
+
+    loaded_pipeline = StableDiffusionPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16,
+        use_safetensors=True,
+        token=HF_TOKEN,
+    )
+    loaded_pipeline = loaded_pipeline.to("cuda")
+    loaded_pipeline.set_progress_bar_config(disable=True)
+
+    pipeline = loaded_pipeline
 
 
 def handler(job):
@@ -60,6 +73,9 @@ def handler(job):
 
     if request.width % 64 != 0 or request.height % 64 != 0:
         raise ValueError("Width and height must be multiples of 64.")
+
+    if pipeline is None:
+        raise RuntimeError("Image model is not loaded.")
 
     if not generation_lock.acquire(blocking=False):
         raise RuntimeError("Worker is busy; retry the job.")
@@ -105,4 +121,10 @@ def handler(job):
         generation_lock.release()
 
 
-runpod.serverless.start({"handler": handler})
+def main():
+    load_model()
+    runpod.serverless.start({"handler": handler})
+
+
+if __name__ == "__main__":
+    main()
