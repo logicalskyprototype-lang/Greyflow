@@ -1,17 +1,15 @@
 
-import base64
 import hmac
 import os
 import re
-from io import BytesIO
 from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.image_validation import decode_valid_png
 from app.runpod_contract import validate_worker_output
 
 
@@ -32,10 +30,6 @@ MAX_RUNPOD_PROMPT_LENGTH = 2000
 MAX_RUNPOD_DIMENSION = 512
 MAX_RUNPOD_STEPS = 35
 
-# Apply resource limits before fully decoding provider-supplied image data.
-MAX_IMAGE_BYTES = 25 * 1024 * 1024
-MAX_IMAGE_PIXELS = 25_000_000
-
 RUNPOD_JOB_STATUSES = frozenset({
     "IN_QUEUE",
     "IN_PROGRESS",
@@ -44,8 +38,6 @@ RUNPOD_JOB_STATUSES = frozenset({
     "CANCELLED",
     "TIMED_OUT",
 })
-
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -143,65 +135,6 @@ class RunPodJobStatus(BaseModel):
     status: str
     output: Any | None = None
     error: str | None = None
-
-
-def is_valid_png(
-    image_bytes: bytes,
-    expected_size: tuple[int, int],
-) -> bool:
-    """Validate PNG structure, dimensions, resource limits, and pixel data."""
-    if (
-        not image_bytes
-        or len(image_bytes) > MAX_IMAGE_BYTES
-        or not image_bytes.startswith(PNG_SIGNATURE)
-    ):
-        return False
-
-    try:
-        # Verify the PNG structure without fully decoding its pixel data.
-        with Image.open(BytesIO(image_bytes)) as image:
-            if image.format != "PNG":
-                return False
-
-            width, height = image.size
-
-            if (
-                width < 1
-                or height < 1
-                or (width, height) != expected_size
-                or width * height > MAX_IMAGE_PIXELS
-            ):
-                return False
-
-            image.verify()
-
-        # Reopen after verify(), then decode the actual pixel data.
-        with Image.open(BytesIO(image_bytes)) as image:
-            if image.format != "PNG":
-                return False
-
-            width, height = image.size
-
-            if (
-                width < 1
-                or height < 1
-                or (width, height) != expected_size
-                or width * height > MAX_IMAGE_PIXELS
-            ):
-                return False
-
-            image.load()
-
-        return True
-
-    except (
-        UnidentifiedImageError,
-        OSError,
-        ValueError,
-        SyntaxError,
-        Image.DecompressionBombError,
-    ):
-        return False
 
 
 def require_api_key(supplied_key: str | None) -> None:
@@ -432,7 +365,6 @@ async def generate_image(
             detail="Could not communicate with the image provider.",
         ) from None
 
-    # Valid JSON can still have an unexpected response structure.
     if not isinstance(provider_result, dict):
         raise HTTPException(
             status_code=502,
@@ -441,10 +373,28 @@ async def generate_image(
 
     image_items = provider_result.get("data")
 
-    if not isinstance(image_items, list) or not image_items:
+    # The request asks for one image. Reject ambiguous responses rather
+    # than returning multiple images or silently selecting one.
+    if not isinstance(image_items, list) or len(image_items) != 1:
         raise HTTPException(
             status_code=502,
-            detail="Image provider returned no image.",
+            detail="Image provider returned an unexpected number of images.",
+        )
+
+    item = image_items[0]
+
+    if not isinstance(item, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Image provider returned an invalid image item.",
+        )
+
+    encoded_image = item.get("b64_json")
+
+    if not isinstance(encoded_image, str) or not encoded_image:
+        raise HTTPException(
+            status_code=502,
+            detail="Image provider returned no usable image data.",
         )
 
     expected_width, expected_height = (
@@ -452,46 +402,25 @@ async def generate_image(
     )
     expected_size = (expected_width, expected_height)
 
-    generated_images: list[GeneratedImage] = []
+    # The helper checks the encoded-length limit before Base64 decoding.
+    image_bytes = decode_valid_png(encoded_image, expected_size)
 
-    for item in image_items:
-        if not isinstance(item, dict):
-            continue
-
-        encoded_image = item.get("b64_json")
-
-        if not isinstance(encoded_image, str) or not encoded_image:
-            continue
-
-        try:
-            image_bytes = base64.b64decode(
-                encoded_image,
-                validate=True,
-            )
-        except (ValueError, TypeError):
-            continue
-
-        if not is_valid_png(image_bytes, expected_size):
-            continue
-
-        generated_images.append(
-            GeneratedImage(
-                model=IMAGE_MODEL,
-                size=request.size,
-                format="png",
-                data_url=f"data:image/png;base64,{encoded_image}",
-            )
-        )
-
-    if not generated_images:
+    if image_bytes is None:
         raise HTTPException(
             status_code=502,
-            detail="Provider response did not contain usable image data.",
+            detail="Provider response did not contain a valid PNG image.",
         )
+
+    generated_image = GeneratedImage(
+        model=IMAGE_MODEL,
+        size=request.size,
+        format="png",
+        data_url=f"data:image/png;base64,{encoded_image}",
+    )
 
     return ImageGenerationResponse(
         status="completed",
-        images=generated_images,
+        images=[generated_image],
     )
 
 
