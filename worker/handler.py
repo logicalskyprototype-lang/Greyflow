@@ -1,6 +1,7 @@
 
 import base64
 import io
+import os
 import secrets
 import threading
 
@@ -10,7 +11,12 @@ from diffusers import StableDiffusionPipeline
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
-MODEL_ID = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+MODEL_ID = os.getenv(
+    "GREYFLOW_SD_MODEL_ID",
+    "stable-diffusion-v1-5/stable-diffusion-v1-5",
+).strip()
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
+
 MAX_PROMPT_LENGTH = 2000
 MAX_STEPS = 35
 MAX_DIMENSION = 512
@@ -23,6 +29,7 @@ pipeline = StableDiffusionPipeline.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.float16,
     use_safetensors=True,
+    token=HF_TOKEN,
 )
 pipeline = pipeline.to("cuda")
 pipeline.set_progress_bar_config(disable=True)
@@ -63,7 +70,6 @@ def handler(job):
             if request.seed is not None
             else secrets.randbelow(2**32)
         )
-
         generator = torch.Generator(device="cuda").manual_seed(seed)
 
         with torch.inference_mode():
@@ -95,7 +101,6 @@ def handler(job):
                 image_bytes
             ).decode("ascii"),
         }
-
     finally:
         generation_lock.release()
 
