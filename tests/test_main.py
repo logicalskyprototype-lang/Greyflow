@@ -1,6 +1,7 @@
 
 import base64
 import io
+import json
 import unittest
 from unittest.mock import patch
 
@@ -43,6 +44,8 @@ class FakeResponse:
             "POST",
             "https://provider.test/request",
         )
+        self.body = json.dumps(payload).encode("utf-8")
+        self.headers = {"Content-Length": str(len(self.body))}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -58,6 +61,15 @@ class FakeResponse:
 
     def json(self):
         return self.payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def aiter_bytes(self):
+        yield self.body
 
 
 class FakeAsyncClient:
@@ -94,6 +106,20 @@ class FakeAsyncClient:
                 "method": "GET",
                 "url": url,
                 "headers": headers or {},
+            }
+        )
+        return FakeResponse(
+            self.next_payload,
+            self.next_status_code,
+        )
+
+    def stream(self, method, url, headers=None, json=None):
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers or {},
+                "json": json,
             }
         )
         return FakeResponse(
@@ -364,8 +390,6 @@ class GreyFlowApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
 
     def test_openai_image_endpoint_preserves_response_format(self):
-        # The OpenAI endpoint requests 1024x1024, so use a real PNG
-        # fixture with exactly those dimensions.
         encoded = png_header_base64(width=1024, height=1024)
 
         FakeAsyncClient.next_payload = {
