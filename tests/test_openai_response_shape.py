@@ -1,4 +1,5 @@
 
+import json
 import unittest
 from unittest.mock import patch
 
@@ -10,12 +11,26 @@ from app import main
 class UnexpectedShapeResponse:
     status_code = 200
 
+    def __init__(self):
+        # Valid JSON, but not the object expected from the provider.
+        self.body = json.dumps(
+            ["unexpected", "provider", "response"]
+        ).encode("utf-8")
+        self.headers = {
+            "Content-Length": str(len(self.body)),
+        }
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def aiter_bytes(self):
+        yield self.body
+
     def raise_for_status(self):
         return None
-
-    def json(self):
-        # Valid JSON, but not the object expected from the provider.
-        return ["unexpected", "provider", "response"]
 
 
 class FakeAsyncClient:
@@ -29,7 +44,7 @@ class FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, traceback):
         return False
 
-    async def post(self, url, headers=None, json=None):
+    def stream(self, method, url, headers=None, json=None):
         return UnexpectedShapeResponse()
 
 
