@@ -1,191 +1,361 @@
-
+import base64
+import hmac
 import os
 import re
-import secrets
-import threading
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Annotated
-
-import torch
-from diffusers import StableDiffusionPipeline
-from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
-
-
-WORKER_API_KEY = os.getenv("GREYFLOW_WORKER_API_KEY", "").strip()
-MODEL_ID = os.getenv(
-    "GREYFLOW_SD_MODEL_ID",
-    "stable-diffusion-v1-5/stable-diffusion-v1-5",
+from typing import Any, Literal
+import httpx
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+APP_NAME = "GreyFlow"
+APP_VERSION = "0.2.0"
+OPENAI_API_URL = "https://api.openai.com/v1/images/generations"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GREYFLOW_API_KEY = os.getenv("GREYFLOW_API_KEY", "").strip()
+IMAGE_MODEL = os.getenv("GREYFLOW_IMAGE_MODEL", "gpt-image-1").strip()
+RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "").strip()
+RUNPOD_IMAGE_ENDPOINT_ID = os.getenv(
+    "RUNPOD_IMAGE_ENDPOINT_ID", ""
 ).strip()
-
-OUTPUT_DIR = Path(
-    os.getenv("GREYFLOW_OUTPUT_DIR", "/data/generated")
-).resolve()
-
-MAX_PROMPT_LENGTH = 2000
-MAX_STEPS = 35
-MAX_DIMENSION = 768
-
-pipeline = None
-generation_lock = threading.Lock()
-
-
-class ImageRequest(BaseModel):
-    job_id: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,100}$")
-    prompt: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
-    width: int = Field(default=512, ge=256, le=MAX_DIMENSION)
-    height: int = Field(default=512, ge=256, le=MAX_DIMENSION)
-    steps: int = Field(default=25, ge=1, le=MAX_STEPS)
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "GREYFLOW_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://localhost:3000",
+    ).split(",")
+    if origin.strip()
+]
+app = FastAPI(
+    title=APP_NAME,
+    description="GreyFlow API for controlled AI task execution.",
+    version=APP_VERSION,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-GreyFlow-API-Key"],
+)
+class ImageGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    prompt: str = Field(min_length=1, max_length=4000)
+    size: Literal[
+        "1024x1024",
+        "1536x1024",
+        "1024x1536",
+    ] = "1024x1024"
+    quality: Literal["low", "medium", "high"] = "medium"
+    @field_validator("prompt")
+    @classmethod
+    def prompt_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Prompt must not be blank.")
+        return value
+class GeneratedImage(BaseModel):
+    model: str
+    size: str
+    format: Literal["png"]
+    data_url: str
+class ImageGenerationResponse(BaseModel):
+    status: Literal["completed"]
+    images: list[GeneratedImage]
+class RunPodImageJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    prompt: str = Field(min_length=1, max_length=2000)
+    width: int = Field(default=512, ge=256, le=512)
+    height: int = Field(default=512, ge=256, le=512)
+    steps: int = Field(default=25, ge=1, le=35)
     seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
-
-
-class ImageOutput(BaseModel):
+    @field_validator("prompt")
+    @classmethod
+    def prompt_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Prompt must not be blank.")
+        return value
+    @field_validator("width", "height")
+    @classmethod
+    def dimensions_must_be_multiples_of_64(cls, value: int) -> int:
+        if value % 64 != 0:
+            raise ValueError("Width and height must be multiples of 64.")
+        return value
+class RunPodJobSubmission(BaseModel):
     job_id: str
     status: str
-    content_type: str
-    output: dict[str, str]
-
-
-def require_worker_key(
-    authorization: Annotated[str | None, Header()] = None,
-) -> None:
-    if not WORKER_API_KEY:
+class RunPodJobStatus(BaseModel):
+    job_id: str
+    status: str
+    output: Any | None = None
+    error: str | None = None
+def require_api_key(supplied_key: str | None) -> None:
+    if not GREYFLOW_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="Worker authentication is not configured.",
+            detail="GreyFlow API authentication is not configured.",
         )
-
-    expected = f"Bearer {WORKER_API_KEY}"
-    if authorization is None or not secrets.compare_digest(
-        authorization, expected
+    if not supplied_key or not hmac.compare_digest(
+        supplied_key, GREYFLOW_API_KEY
     ):
         raise HTTPException(
             status_code=401,
-            detail="Invalid worker credentials.",
+            detail="Invalid or missing GreyFlow API key.",
         )
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global pipeline
-
-    if not WORKER_API_KEY:
-        raise RuntimeError(
-            "GREYFLOW_WORKER_API_KEY must be configured."
-        )
-
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "A CUDA-capable NVIDIA GPU is required for this worker."
-        )
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    pipeline = StableDiffusionPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.float16,
-        use_safetensors=True,
-    )
-    pipeline = pipeline.to("cuda")
-    pipeline.set_progress_bar_config(disable=True)
-
-    yield
-
-    pipeline = None
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-app = FastAPI(
-    title="GreyFlow Image Worker",
-    version="0.1.0",
-    lifespan=lifespan,
-)
-
-
-@app.get("/health")
-def health():
-    return {
-        "service": "greyflow-image-worker",
-        "status": "ready" if pipeline is not None else "starting",
-        "gpu_required": True,
-    }
-
-
-@app.post(
-    "/v1/worker/images",
-    response_model=ImageOutput,
-    dependencies=[Depends(require_worker_key)],
-)
-def generate_image(request: ImageRequest):
-    if pipeline is None:
+def require_runpod_config() -> None:
+    if not RUNPOD_API_KEY or not RUNPOD_IMAGE_ENDPOINT_ID:
         raise HTTPException(
             status_code=503,
-            detail="Image model is not ready.",
+            detail="RunPod image generation is not configured.",
         )
-
-    if request.width % 64 != 0 or request.height % 64 != 0:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", RUNPOD_IMAGE_ENDPOINT_ID):
+        raise HTTPException(
+            status_code=503,
+            detail="RunPod endpoint configuration is invalid.",
+        )
+async def call_runpod(
+    path: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url = (
+        "https://api.runpod.ai/v2/"
+        f"{RUNPOD_IMAGE_ENDPOINT_ID}/{path}"
+    )
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {RUNPOD_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            result = response.json()
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="RunPod request timed out. Check the job status before retrying.",
+        ) from None
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail="RunPod rate limit reached. Try again later.",
+            ) from None
+        if exc.response.status_code in (401, 403):
+            raise HTTPException(
+                status_code=502,
+                detail="RunPod rejected the server credentials.",
+            ) from None
+        if exc.response.status_code == 404:
+            raise HTTPException(
+                status_code=404,
+                detail="RunPod job or endpoint was not found.",
+            ) from None
+        raise HTTPException(
+            status_code=502,
+            detail="RunPod could not complete the request.",
+        ) from None
+    except (httpx.RequestError, ValueError):
+        raise HTTPException(
+            status_code=502,
+            detail="Could not communicate with RunPod.",
+        ) from None
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="RunPod returned an invalid response.",
+        )
+    return result
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {
+        "name": APP_NAME,
+        "version": APP_VERSION,
+        "message": "GreyFlow API is running.",
+        "health": "/health",
+        "image_endpoint": "/v1/images/generations",
+        "runpod_submit_endpoint": "/v1/jobs/images",
+        "runpod_status_endpoint": "/v1/jobs/images/{job_id}",
+    }
+@app.get("/health")
+async def health() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "image_generation_configured": bool(
+            OPENAI_API_KEY and GREYFLOW_API_KEY
+        ),
+        "runpod_image_generation_configured": bool(
+            RUNPOD_API_KEY and RUNPOD_IMAGE_ENDPOINT_ID
+        ),
+    }
+@app.post(
+    "/v1/images/generations",
+    response_model=ImageGenerationResponse,
+)
+async def generate_image(
+    request: ImageGenerationRequest,
+    x_greyflow_api_key: str | None = Header(
+        default=None,
+        alias="X-GreyFlow-API-Key",
+    ),
+) -> ImageGenerationResponse:
+    require_api_key(x_greyflow_api_key)
+    if not OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Image provider credentials are not configured.",
+        )
+    provider_payload = {
+        "model": IMAGE_MODEL,
+        "prompt": request.prompt,
+        "size": request.size,
+        "quality": request.quality,
+        "n": 1,
+        "output_format": "png",
+    }
+    timeout = httpx.Timeout(120.0, connect=10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                OPENAI_API_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=provider_payload,
+            )
+            response.raise_for_status()
+            provider_result = response.json()
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="Image generation timed out. Please try again.",
+        ) from None
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail="Image provider rate limit reached. Try again later.",
+            ) from None
+        raise HTTPException(
+            status_code=502,
+            detail="Image provider could not complete the request.",
+        ) from None
+    except (httpx.RequestError, ValueError):
+        raise HTTPException(
+            status_code=502,
+            detail="Could not communicate with the image provider.",
+        ) from None
+    image_items = provider_result.get("data", [])
+    if not isinstance(image_items, list) or not image_items:
+        raise HTTPException(
+            status_code=502,
+            detail="Image provider returned no image.",
+        )
+    generated_images: list[GeneratedImage] = []
+    for item in image_items:
+        if not isinstance(item, dict):
+            continue
+        encoded_image = item.get("b64_json")
+        if not isinstance(encoded_image, str) or not encoded_image:
+            continue
+        try:
+            base64.b64decode(encoded_image, validate=True)
+        except (ValueError, TypeError):
+            continue
+        generated_images.append(
+            GeneratedImage(
+                model=IMAGE_MODEL,
+                size=request.size,
+                format="png",
+                data_url=f"data:image/png;base64,{encoded_image}",
+            )
+        )
+    if not generated_images:
+        raise HTTPException(
+            status_code=502,
+            detail="Provider response did not contain usable image data.",
+        )
+    return ImageGenerationResponse(
+        status="completed",
+        images=generated_images,
+    )
+@app.post(
+    "/v1/jobs/images",
+    response_model=RunPodJobSubmission,
+    status_code=202,
+)
+async def submit_runpod_image_job(
+    request: RunPodImageJobRequest,
+    x_greyflow_api_key: str | None = Header(
+        default=None,
+        alias="X-GreyFlow-API-Key",
+    ),
+) -> RunPodJobSubmission:
+    require_api_key(x_greyflow_api_key)
+    require_runpod_config()
+    payload = {
+        "input": {
+            "prompt": request.prompt,
+            "width": request.width,
+            "height": request.height,
+            "steps": request.steps,
+            "seed": request.seed,
+        }
+    }
+    result = await call_runpod("run", payload)
+    job_id = result.get("id")
+    status = result.get("status")
+    if not isinstance(job_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,128}", job_id
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail="RunPod returned an invalid job identifier.",
+        )
+    if not isinstance(status, str):
+        raise HTTPException(
+            status_code=502,
+            detail="RunPod returned an invalid job status.",
+        )
+    return RunPodJobSubmission(job_id=job_id, status=status)
+@app.get(
+    "/v1/jobs/images/{job_id}",
+    response_model=RunPodJobStatus,
+)
+async def get_runpod_image_job(
+    job_id: str,
+    x_greyflow_api_key: str | None = Header(
+        default=None,
+        alias="X-GreyFlow-API-Key",
+    ),
+) -> RunPodJobStatus:
+    require_api_key(x_greyflow_api_key)
+    require_runpod_config()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job_id):
         raise HTTPException(
             status_code=422,
-            detail="Width and height must be multiples of 64.",
+            detail="Invalid job identifier.",
         )
-
-    # Restrict each request to a single inference at a time.
-    if not generation_lock.acquire(blocking=False):
+    result = await call_runpod(f"status/{job_id}")
+    returned_id = result.get("id")
+    status = result.get("status")
+    if returned_id != job_id or not isinstance(status, str):
         raise HTTPException(
-            status_code=429,
-            detail="Worker is busy. Retry later.",
+            status_code=502,
+            detail="RunPod returned an invalid job status response.",
         )
-
-    try:
-        seed = request.seed
-        generator = torch.Generator(device="cuda")
-
-        if seed is None:
-            seed = secrets.randbelow(2**32)
-
-        generator.manual_seed(seed)
-
-        with torch.inference_mode():
-            result = pipeline(
-                prompt=request.prompt,
-                width=request.width,
-                height=request.height,
-                num_inference_steps=request.steps,
-                generator=generator,
-            )
-
-        image = result.images[0]
-
-        # Never use a customer-provided path or filename.
-        filename = f"{request.job_id}.png"
-        destination = (OUTPUT_DIR / filename).resolve()
-
-        if destination.parent != OUTPUT_DIR:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid output identifier.",
-            )
-
-        image.save(destination, format="PNG")
-
-        return ImageOutput(
-            job_id=request.job_id,
-            status="completed",
-            content_type="image/png",
-            output={
-                "storage_key": f"generated/{filename}",
-            },
-        )
-
-    except HTTPException:
-        raise
-    except Exception:
-        # Avoid exposing model paths, prompts, or internal errors.
-        raise HTTPException(
-            status_code=500,
-            detail="Image generation failed.",
-        ) from None
-    finally:
-        generation_lock.release()
+    output = result.get("output")
+    error = result.get("error")
+    return RunPodJobStatus(
+        job_id=job_id,
+        status=status,
+        output=output,
+        error=error if isinstance(error, str) else None,
+    )
