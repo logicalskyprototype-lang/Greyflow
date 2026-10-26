@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_BASE64_LENGTH = 4 * ((MAX_IMAGE_BYTES + 2) // 3)
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -60,6 +61,10 @@ class RunPodImageOutput(BaseModel):
     @field_validator("image_base64")
     @classmethod
     def validate_png_data(cls, value: str) -> str:
+        # Reject oversized encoded input before allocating decoded bytes.
+        if len(value) > MAX_IMAGE_BASE64_LENGTH:
+            raise ValueError("Image exceeds the maximum allowed size.")
+
         try:
             image_bytes = base64.b64decode(value, validate=True)
         except (binascii.Error, ValueError):
