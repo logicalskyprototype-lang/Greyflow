@@ -30,6 +30,7 @@ MAX_PROMPT_LENGTH = 4000
 MAX_RUNPOD_PROMPT_LENGTH = 2000
 MAX_RUNPOD_DIMENSION = 512
 MAX_RUNPOD_STEPS = 35
+MAX_RUNPOD_ERROR_LENGTH = 1000
 
 # A 25 MiB image needs at most about 33.34 MiB of Base64.
 # Leave limited room for the surrounding JSON response.
@@ -576,7 +577,12 @@ async def get_runpod_image_job(
         )
 
     error_value = result.get("error")
-    error = error_value if isinstance(error_value, str) else None
+
+    if isinstance(error_value, str):
+        error = error_value[:MAX_RUNPOD_ERROR_LENGTH]
+    else:
+        error = None
+
     output = result.get("output")
 
     if status == "COMPLETED":
