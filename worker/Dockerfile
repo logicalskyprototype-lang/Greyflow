@@ -8,11 +8,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+COPY worker/requirements.txt /app/requirements.txt
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r /app/requirements.txt
 
-COPY handler.py /app/handler.py
+COPY worker/handler.py /app/handler.py
 
 CMD ["python", "-u", "handler.py"]
