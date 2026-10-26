@@ -1,3 +1,4 @@
+
 import json
 import unittest
 from unittest.mock import patch
@@ -269,6 +270,51 @@ class RunPodResponseFailureTests(unittest.TestCase):
             response.json()["error"],
             "Mock provider failure",
         )
+
+    def test_oversized_job_error_is_truncated_to_1000_characters(
+        self,
+    ):
+        oversized_error = "E" * (
+            main.MAX_RUNPOD_ERROR_LENGTH + 500
+        )
+        FakeAsyncClient.next_payload = {
+            "id": "job_123",
+            "status": "FAILED",
+            "error": oversized_error,
+        }
+
+        response = self.check_job_status()
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            msg=response.text,
+        )
+        returned_error = response.json()["error"]
+        self.assertEqual(
+            len(returned_error),
+            main.MAX_RUNPOD_ERROR_LENGTH,
+        )
+        self.assertEqual(
+            returned_error,
+            oversized_error[:main.MAX_RUNPOD_ERROR_LENGTH],
+        )
+
+    def test_non_string_job_error_is_returned_as_none(self):
+        FakeAsyncClient.next_payload = {
+            "id": "job_123",
+            "status": "FAILED",
+            "error": {"internal": "unexpected error structure"},
+        }
+
+        response = self.check_job_status()
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            msg=response.text,
+        )
+        self.assertIsNone(response.json()["error"])
 
     def test_oversized_content_length_is_rejected(self):
         FakeAsyncClient.next_payload = {
