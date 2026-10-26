@@ -2,7 +2,6 @@
 import unittest
 from unittest.mock import patch
 
-import httpx
 from fastapi.testclient import TestClient
 
 from app import main
@@ -15,11 +14,15 @@ class UnexpectedShapeResponse:
         return None
 
     def json(self):
-        # Simulates valid JSON with the wrong top-level structure.
+        # Valid JSON, but not the object expected from the provider.
         return ["unexpected", "provider", "response"]
 
 
 class FakeAsyncClient:
+    def __init__(self, *args, **kwargs):
+        # Accept the same constructor arguments used by httpx.AsyncClient.
+        pass
+
     async def __aenter__(self):
         return self
 
@@ -71,6 +74,7 @@ class OpenAIResponseShapeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertNotIn("test-openai-key", response.text)
         self.assertNotIn("AttributeError", response.text)
+        self.assertNotIn("TypeError", response.text)
 
 
 if __name__ == "__main__":
