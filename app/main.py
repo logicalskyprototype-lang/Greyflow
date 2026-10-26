@@ -1,3 +1,4 @@
+
 import base64
 import hmac
 import os
@@ -29,8 +30,6 @@ MAX_RUNPOD_PROMPT_LENGTH = 2000
 MAX_RUNPOD_DIMENSION = 512
 MAX_RUNPOD_STEPS = 35
 
-# Accepted job statuses returned by RunPod.
-# Unknown statuses are treated as invalid upstream responses.
 RUNPOD_JOB_STATUSES = frozenset({
     "IN_QUEUE",
     "IN_PROGRESS",
@@ -366,9 +365,17 @@ async def generate_image(
             detail="Could not communicate with the image provider.",
         ) from None
 
-    image_items = provider_result.get("data", [])
+    # JSON can be syntactically valid without having the expected structure.
+    # Validate the top-level type before calling dictionary methods.
+    if not isinstance(provider_result, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Image provider returned an invalid response.",
+        )
 
-    if not image_items or not isinstance(image_items, list):
+    image_items = provider_result.get("data")
+
+    if not isinstance(image_items, list) or not image_items:
         raise HTTPException(
             status_code=502,
             detail="Image provider returned no image.",
