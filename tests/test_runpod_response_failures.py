@@ -1,3 +1,4 @@
+
 import unittest
 from unittest.mock import patch
 
@@ -8,9 +9,15 @@ from app import main
 
 
 class FakeResponse:
-    def __init__(self, payload, status_code=200):
+    def __init__(
+        self,
+        payload,
+        status_code=200,
+        json_exception=None,
+    ):
         self.payload = payload
         self.status_code = status_code
+        self.json_exception = json_exception
         self.request = httpx.Request(
             "POST",
             "https://provider.test/request",
@@ -29,6 +36,8 @@ class FakeResponse:
             )
 
     def json(self):
+        if self.json_exception is not None:
+            raise self.json_exception
         return self.payload
 
 
@@ -36,6 +45,7 @@ class FakeAsyncClient:
     next_payload = {}
     next_status_code = 200
     next_exception = None
+    next_json_exception = None
     calls = []
 
     def __init__(self, **kwargs):
@@ -48,9 +58,7 @@ class FakeAsyncClient:
         return False
 
     async def post(self, url, headers=None, json=None):
-        self.calls.append(
-            ("POST", url, headers or {}, json)
-        )
+        self.calls.append(("POST", url, headers or {}, json))
 
         if self.next_exception is not None:
             raise self.next_exception
@@ -58,12 +66,11 @@ class FakeAsyncClient:
         return FakeResponse(
             self.next_payload,
             self.next_status_code,
+            self.next_json_exception,
         )
 
     async def get(self, url, headers=None):
-        self.calls.append(
-            ("GET", url, headers or {}, None)
-        )
+        self.calls.append(("GET", url, headers or {}, None))
 
         if self.next_exception is not None:
             raise self.next_exception
@@ -71,6 +78,7 @@ class FakeAsyncClient:
         return FakeResponse(
             self.next_payload,
             self.next_status_code,
+            self.next_json_exception,
         )
 
 
@@ -91,6 +99,7 @@ class RunPodResponseFailureTests(unittest.TestCase):
         FakeAsyncClient.next_payload = {}
         FakeAsyncClient.next_status_code = 200
         FakeAsyncClient.next_exception = None
+        FakeAsyncClient.next_json_exception = None
         FakeAsyncClient.calls = []
 
         self.client_patch = patch.object(
@@ -129,27 +138,17 @@ class RunPodResponseFailureTests(unittest.TestCase):
         for payload in (None, [], "unexpected response"):
             with self.subTest(payload=payload):
                 FakeAsyncClient.next_payload = payload
-
                 response = self.submit_job()
-
                 self.assertEqual(response.status_code, 502)
 
     def test_submission_rejects_missing_job_id(self):
-        FakeAsyncClient.next_payload = {
-            "status": "IN_QUEUE",
-        }
-
+        FakeAsyncClient.next_payload = {"status": "IN_QUEUE"}
         response = self.submit_job()
-
         self.assertEqual(response.status_code, 502)
 
     def test_submission_rejects_missing_status(self):
-        FakeAsyncClient.next_payload = {
-            "id": "job_123",
-        }
-
+        FakeAsyncClient.next_payload = {"id": "job_123"}
         response = self.submit_job()
-
         self.assertEqual(response.status_code, 502)
 
     def test_submission_rejects_invalid_job_id(self):
@@ -157,9 +156,7 @@ class RunPodResponseFailureTests(unittest.TestCase):
             "id": "job/123",
             "status": "IN_QUEUE",
         }
-
         response = self.submit_job()
-
         self.assertEqual(response.status_code, 502)
 
     def test_submission_rejects_unknown_status(self):
@@ -167,18 +164,12 @@ class RunPodResponseFailureTests(unittest.TestCase):
             "id": "job_123",
             "status": "UNRECOGNIZED_STATUS",
         }
-
         response = self.submit_job()
-
         self.assertEqual(response.status_code, 502)
 
     def test_status_response_rejects_missing_status(self):
-        FakeAsyncClient.next_payload = {
-            "id": "job_123",
-        }
-
+        FakeAsyncClient.next_payload = {"id": "job_123"}
         response = self.check_job_status()
-
         self.assertEqual(response.status_code, 502)
 
     def test_status_response_rejects_unknown_status(self):
@@ -186,9 +177,7 @@ class RunPodResponseFailureTests(unittest.TestCase):
             "id": "job_123",
             "status": "UNRECOGNIZED_STATUS",
         }
-
         response = self.check_job_status()
-
         self.assertEqual(response.status_code, 502)
 
     def test_status_response_rejects_mismatched_job_id(self):
@@ -196,9 +185,7 @@ class RunPodResponseFailureTests(unittest.TestCase):
             "id": "different_job",
             "status": "IN_PROGRESS",
         }
-
         response = self.check_job_status()
-
         self.assertEqual(response.status_code, 502)
 
     def test_lifecycle_statuses_are_returned_correctly(self):
@@ -248,16 +235,13 @@ class RunPodResponseFailureTests(unittest.TestCase):
         response = self.check_job_status()
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json()["status"],
-            "FAILED",
-        )
+        self.assertEqual(response.json()["status"], "FAILED")
         self.assertEqual(
             response.json()["error"],
             "Mock provider failure",
         )
 
-    def test_submission_timeout_returns_504(self):
+    def test_submission_timeout_returns_504_without_auto_retry(self):
         FakeAsyncClient.next_exception = httpx.ReadTimeout(
             "Mock submission timeout"
         )
@@ -265,13 +249,11 @@ class RunPodResponseFailureTests(unittest.TestCase):
         response = self.submit_job()
 
         self.assertEqual(response.status_code, 504)
-        self.assertIn(
-            "may have been accepted",
-            response.json()["detail"],
-        )
-        self.assertIn(
-            "do not retry automatically",
-            response.json()["detail"],
+        self.assertIn("may have been accepted", response.json()["detail"])
+        self.assertIn("do not retry automatically", response.json()["detail"])
+        self.assertEqual(
+            sum(call[0] == "POST" for call in FakeAsyncClient.calls),
+            1,
         )
 
     def test_status_polling_timeout_returns_504(self):
@@ -282,20 +264,83 @@ class RunPodResponseFailureTests(unittest.TestCase):
         response = self.check_job_status()
 
         self.assertEqual(response.status_code, 504)
-        self.assertIn(
-            "same job ID",
-            response.json()["detail"],
-        )
+        self.assertIn("same job ID", response.json()["detail"])
 
     def test_submission_provider_server_error_returns_502(self):
         FakeAsyncClient.next_status_code = 500
-        FakeAsyncClient.next_payload = {
-            "error": "Mock provider error",
-        }
+        FakeAsyncClient.next_payload = {"error": "Mock provider error"}
 
         response = self.submit_job()
 
         self.assertEqual(response.status_code, 502)
+
+    def test_rate_limit_returns_429_for_submission_and_polling(self):
+        for request in ("submit", "poll"):
+            with self.subTest(request=request):
+                FakeAsyncClient.next_status_code = 429
+
+                response = (
+                    self.submit_job()
+                    if request == "submit"
+                    else self.check_job_status()
+                )
+
+                self.assertEqual(response.status_code, 429)
+                self.assertIn("rate limit", response.json()["detail"].lower())
+
+    def test_missing_job_during_polling_returns_404(self):
+        FakeAsyncClient.next_status_code = 404
+
+        response = self.check_job_status()
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            response.json()["detail"],
+            "RunPod job was not found.",
+        )
+
+    def test_provider_auth_failures_return_502_without_leaking_secrets(self):
+        for status_code in (401, 403):
+            with self.subTest(status_code=status_code):
+                FakeAsyncClient.next_status_code = status_code
+
+                response = self.submit_job()
+
+                self.assertEqual(response.status_code, 502)
+                self.assertNotIn("test-runpod-key", response.text)
+                self.assertNotIn("Bearer", response.text)
+
+    def test_malformed_provider_json_returns_502(self):
+        for request in ("submit", "poll"):
+            with self.subTest(request=request):
+                FakeAsyncClient.next_json_exception = ValueError(
+                    "Malformed provider JSON"
+                )
+
+                response = (
+                    self.submit_job()
+                    if request == "submit"
+                    else self.check_job_status()
+                )
+
+                self.assertEqual(response.status_code, 502)
+                self.assertNotIn("Malformed provider JSON", response.text)
+
+    def test_connection_failure_returns_502(self):
+        request = httpx.Request(
+            "POST",
+            "https://provider.test/request",
+        )
+        FakeAsyncClient.next_exception = httpx.ConnectError(
+            "Mock connection failure",
+            request=request,
+        )
+
+        response = self.submit_job()
+
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("Mock connection failure", response.text)
+        self.assertNotIn("test-runpod-key", response.text)
 
     def test_missing_runpod_configuration_returns_503(self):
         main.RUNPOD_API_KEY = ""
