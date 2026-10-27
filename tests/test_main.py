@@ -361,6 +361,41 @@ class GreyFlowApiTests(unittest.TestCase):
         self.assertEqual(response.json()["status"], "IN_QUEUE")
         self.assertIsNone(response.json()["output"])
 
+    def test_non_completed_jobs_never_expose_provider_output(self):
+        non_completed_statuses = (
+            "IN_QUEUE",
+            "IN_PROGRESS",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+        )
+
+        unexpected_output = {
+            "sensitive": "must not be forwarded",
+            "image_base64": "unvalidated-provider-data",
+        }
+
+        for status in non_completed_statuses:
+            with self.subTest(status=status):
+                FakeAsyncClient.next_payload = {
+                    "id": "job_123",
+                    "status": status,
+                    "output": unexpected_output,
+                }
+
+                response = self.get_job_status()
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json()["job_id"],
+                    "job_123",
+                )
+                self.assertEqual(
+                    response.json()["status"],
+                    status,
+                )
+                self.assertIsNone(response.json()["output"])
+
     def test_runpod_rejects_invalid_dimensions(self):
         response = self.client.post(
             "/v1/jobs/images",
